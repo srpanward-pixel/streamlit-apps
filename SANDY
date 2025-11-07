@@ -1,0 +1,474 @@
+"""
+Stock Market Visualizer — Streamlit app
+Features:
+ - Fetch data with yfinance (real-time/historical)
+ - Interactive Plotly candlesticks with overlays: EMA (20/50/200), RSI, Bollinger Bands
+ - Technical indicators: RSI, MACD, EMA, Bollinger, OBV, ATR, Fibonacci levels
+ - Signal engine for short-term trading using combinations (RSI+MACD+EMA, Bollinger+RSI div, Fib+OBV, MACD+EMA)
+ - Portfolio upload (CSV/Excel), compute basic financial ratios and correlation analysis
+ - Export charts (PNG/HTML) and save/load user configurations (YAML)
+
+How to run:
+ 1. Save this file as `stock_market_visualizer.py`.
+ 2. Install requirements from the provided requirements.txt.
+ 3. Run: `streamlit run stock_market_visualizer.py`
+
+Notes: This app uses `ta` for indicators and `kaleido` for exporting images.
+"""
+
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import io
+import yaml
+import datetime
+from ta.momentum import RSIIndicator
+from ta.trend import EMAIndicator, MACD
+from ta.volatility import BollingerBands, AverageTrueRange
+from ta.volume import OnBalanceVolumeIndicator
+
+st.set_page_config(page_title="Stock Market Visualizer", layout="wide")
+
+# -------------------------
+# Utilities & indicators
+# -------------------------
+
+def fetch_data(ticker: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
+    df = yf.download(ticker, period=period, interval=interval, progress=False)
+    if df.empty:
+        raise ValueError("No data fetched — check ticker / interval")
+    df = df.dropna()
+    return df
+
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # RSI
+    df['RSI'] = RSIIndicator(df['Close'], window=14).rsi()
+    # MACD
+    macd = MACD(close=df['Close'], window_slow=26, window_fast=12, window_sign=9)
+    df['MACD'] = macd.macd()
+    df['MACD_signal'] = macd.macd_signal()
+    df['MACD_hist'] = macd.macd_diff()
+    # EMA
+    df['EMA20'] = EMAIndicator(df['Close'], window=20).ema_indicator()
+    df['EMA50'] = EMAIndicator(df['Close'], window=50).ema_indicator()
+    df['EMA200'] = EMAIndicator(df['Close'], window=200).ema_indicator()
+    # Bollinger
+    bb = BollingerBands(df['Close'], window=20, window_dev=2)
+    df['BB_mid'] = bb.bollinger_mavg()
+    df['BB_upper'] = bb.bollinger_hband()
+    df['BB_lower'] = bb.bollinger_lband()
+    df['BB_width'] = (df['BB_upper'] - df['BB_lower']) / df['BB_mid']
+    # OBV
+    df['OBV'] = OnBalanceVolumeIndicator(df['Close'], df['Volume']).on_balance_volume()
+    # ATR
+    df['ATR'] = AverageTrueRange(df['High'], df['Low'], df['Close'], window=14).average_true_range()
+    return df
+
+
+def macd_signals(df: pd.DataFrame) -> pd.DataFrame:
+    df['MACD_bull'] = (df['MACD'] > df['MACD_signal']) & (df['MACD'].shift(1) <= df['MACD_signal'].shift(1))
+    df['MACD_bear'] = (df['MACD'] < df['MACD_signal']) & (df['MACD'].shift(1) >= df['MACD_signal'].shift(1))
+    return df
+
+
+def ema_cross_signals(df: pd.DataFrame) -> pd.DataFrame:
+    df['EMA20_50_golden'] = (df['EMA20'] > df['EMA50']) & (df['EMA20'].shift(1) <= df['EMA50'].shift(1))
+    df['EMA20_50_death'] = (df['EMA20'] < df['EMA50']) & (df['EMA20'].shift(1) >= df['EMA50'].shift(1))
+    df['EMA50_200_golden'] = (df['EMA50'] > df['EMA200']) & (df['EMA50'].shift(1) <= df['EMA200'].shift(1))
+    df['EMA50_200_death'] = (df['EMA50'] < df['EMA200']) & (df['EMA50'].shift(1) >= df['EMA200'].shift(1))
+    return df
+
+
+def bollinger_squeeze(df: pd.DataFrame, width_threshold: float = 0.05) -> pd.DataFrame:
+    df['BB_squeeze'] = df['BB_width'] < width_threshold
+    df['BB_breakout_up'] = (df['Close'] > df['BB_upper']) & (df['Close'].shift(1) <= df['BB_upper'].shift(1))
+    df['BB_breakout_down'] = (df['Close'] < df['BB_lower']) & (df['Close'].shift(1) >= df['BB_lower'].shift(1))
+    return df
+
+
+def simple_rsi_divergence(df: pd.DataFrame, lookback: int = 14) -> pd.DataFrame:
+    # simple detection: recent price lower low & RSI higher low
+    div = [False] * len(df)
+    for i in range(lookback, len(df)):
+        prev_window = df.iloc[i-2*lookback:i-lookback+1]
+        cur_window = df.iloc[i-lookback:i+1]
+        if len(prev_window) < 1:
+            continue
+        prev_low_idx = prev_window['Close'].idxmin()
+        cur_low_idx = cur_window['Close'].idxmin()
+        if prev_low_idx is None or cur_low_idx is None or cur_low_idx <= prev_low_idx:
+            continue
+        try:
+            if (df.loc[cur_low_idx,'Close'] < df.loc[prev_low_idx,'Close']) and (df.loc[cur_low_idx,'RSI'] > df.loc[prev_low_idx,'RSI']):
+                div[i] = True
+        except Exception:
+            pass
+    df['RSI_divergence'] = div
+    return df
+
+
+def fib_levels(df: pd.DataFrame, lookback: int = 100) -> dict:
+    sub = df[-lookback:]
+    hi = float(sub['High'].max())
+    lo = float(sub['Low'].min())
+    diff = hi - lo
+    return {
+        '0%': hi,
+        '23.6%': hi - diff*0.236,
+        '38.2%': hi - diff*0.382,
+        '50%': hi - diff*0.5,
+        '61.8%': hi - diff*0.618,
+        '100%': lo
+    }
+
+
+def obv_confirm(df: pd.DataFrame) -> pd.DataFrame:
+    df['Price_up'] = df['Close'] > df['Close'].shift(1)
+    df['OBV_up'] = df['OBV'] > df['OBV'].shift(1)
+    df['OBV_confirm_up'] = df['Price_up'] & df['OBV_up']
+    return df
+
+
+def atr_stoploss(price: float, atr: float, multiplier: float = 1.5) -> float:
+    return price - multiplier * atr
+
+# -------------------------
+# Signal engine (short-term trading combos)
+# -------------------------
+
+def compute_signals(df: pd.DataFrame, fib_lookback: int = 100) -> pd.DataFrame:
+    signals = []
+    # 1. RSI + MACD + EMA (buy when RSI low, MACD bull, EMA20>EMA50)
+    cond1 = (df['RSI'] < 35) & (df['MACD_bull']) & (df['EMA20'] > df['EMA50'])
+    for idx in df[cond1].index:
+        signals.append({'time': idx, 'signal': 'BUY (RSI+MACD+EMA)', 'price': float(df.loc[idx,'Close']),
+                        'reason': f"RSI {df.loc[idx,'RSI']:.1f} <35, MACD bullish cross, EMA20>EMA50",
+                        'stop_loss': float(atr_stoploss(df.loc[idx,'Close'], df.loc[idx,'ATR']))})
+    # 2. Bollinger + RSI divergence
+    cond2 = (df['RSI_divergence']) & (df['Close'] < df['BB_lower'])
+    for idx in df[cond2].index:
+        signals.append({'time': idx, 'signal': 'BUY (BB lower + RSI div)', 'price': float(df.loc[idx,'Close']),
+                        'reason': f"Price below lower BB and RSI divergence (RSI {df.loc[idx,'RSI']:.1f})",
+                        'stop_loss': float(atr_stoploss(df.loc[idx,'Close'], df.loc[idx,'ATR']))})
+    # 3. Fibonacci + OBV
+    fibs = fib_levels(df, lookback=fib_lookback)
+    for label, level in fibs.items():
+        closeness = 0.008
+        cand = df[ (np.abs(df['Close'] - level) / level) < closeness ]
+        for idx in cand.index:
+            if df.loc[idx,'OBV_confirm_up']:
+                signals.append({'time': idx, 'signal': f'BUY (Fib {label} + OBV)', 'price': float(df.loc[idx,'Close']),
+                                'reason': f"Price near Fib {label} ({level:.2f}) and OBV confirming uptrend",
+                                'stop_loss': float(atr_stoploss(df.loc[idx,'Close'], df.loc[idx,'ATR']))})
+    # 4. MACD + EMA crossover
+    cond4 = (df['MACD_bull']) & (df['EMA20_50_golden'])
+    for idx in df[cond4].index:
+        signals.append({'time': idx, 'signal': 'BUY (MACD + EMA20/50 golden)', 'price': float(df.loc[idx,'Close']),
+                        'reason': 'MACD bullish cross and EMA20/50 golden cross',
+                        'stop_loss': float(atr_stoploss(df.loc[idx,'Close'], df.loc[idx,'ATR']))})
+
+    # SELL signals (bearish)
+    sell1 = (df['RSI'] > 70) & (df['MACD_bear'])
+    for idx in df[sell1].index:
+        signals.append({'time': idx, 'signal': 'SELL (RSI+MACD)', 'price': float(df.loc[idx,'Close']),
+                        'reason': f"RSI {df.loc[idx,'RSI']:.1f} >70 and MACD bearish cross",
+                        'stop_loss': float(df.loc[idx,'Close'] + 1.5*df.loc[idx,'ATR'])})
+    sell2 = (df['RSI_divergence']) & (df['Close'] > df['BB_upper'])
+    for idx in df[sell2].index:
+        signals.append({'time': idx, 'signal': 'SELL (BB upper + RSI div)', 'price': float(df.loc[idx,'Close']),
+                        'reason': f"Price above upper BB and RSI divergence (RSI {df.loc[idx,'RSI']:.1f})",
+                        'stop_loss': float(df.loc[idx,'Close'] + 1.5*df.loc[idx,'ATR'])})
+
+    s_df = pd.DataFrame(signals)
+    if not s_df.empty:
+        s_df = s_df.sort_values('time', ascending=False).reset_index(drop=True)
+    return s_df
+
+# -------------------------
+# Plotting helpers
+# -------------------------
+
+def plot_price(df: pd.DataFrame, ticker: str, show_ema: bool = True, show_bb: bool = True, fibs: dict | None = None):
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price'))
+    if show_ema:
+        if 'EMA20' in df: fig.add_trace(go.Scatter(x=df.index, y=df['EMA20'], name='EMA20', line=dict(width=1)))
+        if 'EMA50' in df: fig.add_trace(go.Scatter(x=df.index, y=df['EMA50'], name='EMA50', line=dict(width=1)))
+        if 'EMA200' in df: fig.add_trace(go.Scatter(x=df.index, y=df['EMA200'], name='EMA200', line=dict(width=1)))
+    if show_bb and 'BB_upper' in df:
+        fig.add_trace(go.Scatter(x=df.index, y=df['BB_upper'], name='BB Upper', line=dict(width=1), opacity=0.4))
+        fig.add_trace(go.Scatter(x=df.index, y=df['BB_lower'], name='BB Lower', line=dict(width=1), opacity=0.4, fill='tonexty'))
+    if fibs:
+        for label, level in fibs.items():
+            fig.add_hline(y=level, line_dash='dot', annotation_text=label, opacity=0.6)
+    fig.update_layout(title=f"{ticker} — Price Chart", xaxis_rangeslider_visible=False, height=600)
+    return fig
+
+
+def plot_rsi_macd(df: pd.DataFrame):
+    fig_rsi = go.Figure()
+    fig_rsi.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI'))
+    fig_rsi.add_hline(y=70, line_dash='dash')
+    fig_rsi.add_hline(y=30, line_dash='dash')
+    fig_rsi.update_layout(title='RSI (14)', height=250)
+
+    fig_macd = go.Figure()
+    fig_macd.add_trace(go.Scatter(x=df.index, y=df['MACD'], name='MACD'))
+    fig_macd.add_trace(go.Scatter(x=df.index, y=df['MACD_signal'], name='MACD Signal'))
+    fig_macd.add_trace(go.Bar(x=df.index, y=df['MACD_hist'], name='MACD Hist'))
+    fig_macd.update_layout(title='MACD', height=300)
+    return fig_rsi, fig_macd
+
+
+def plot_obv_atr(df: pd.DataFrame):
+    fig_obv = go.Figure()
+    fig_obv.add_trace(go.Scatter(x=df.index, y=df['OBV'], name='OBV'))
+    fig_obv.update_layout(title='OBV', height=250)
+
+    fig_atr = go.Figure()
+    fig_atr.add_trace(go.Scatter(x=df.index, y=df['ATR'], name='ATR'))
+    fig_atr.update_layout(title='ATR (14)', height=200)
+    return fig_obv, fig_atr
+
+# -------------------------
+# Portfolio: upload & analysis
+# -------------------------
+
+def load_portfolio(uploaded_file) -> pd.DataFrame:
+    if uploaded_file is None:
+        return pd.DataFrame()
+    name = uploaded_file.name.lower()
+    if name.endswith('.csv'):
+        df = pd.read_csv(uploaded_file)
+    elif name.endswith(('.xls', '.xlsx')):
+        df = pd.read_excel(uploaded_file)
+    else:
+        st.error('Upload CSV or Excel file with a column `Ticker` (and optional `Shares`, `AvgPrice`).')
+        return pd.DataFrame()
+    return df
+
+
+def portfolio_summary(port_df: pd.DataFrame):
+    # Expect column Ticker, optional Shares, AvgPrice
+    if 'Ticker' not in port_df.columns and 'ticker' not in port_df.columns:
+        st.error('Portfolio file must contain a `Ticker` column (case-insensitive).')
+        return None
+    port_df = port_df.rename(columns={c: c.capitalize() for c in port_df.columns})
+    tickers = port_df['Ticker'].astype(str).unique().tolist()
+    info = []
+    prices = {}
+    for t in tickers:
+        try:
+            tk = yf.Ticker(t)
+            price = float(tk.history(period='1d')['Close'].iloc[-1])
+            info.append({'Ticker': t, 'Price': price, 'Name': tk.info.get('shortName', '')})
+            prices[t] = price
+        except Exception:
+            info.append({'Ticker': t, 'Price': np.nan, 'Name': ''})
+            prices[t] = np.nan
+    info_df = pd.DataFrame(info)
+    return info_df, prices
+
+# -------------------------
+# Config save/load
+# -------------------------
+
+def save_config(cfg: dict) -> bytes:
+    return yaml.safe_dump(cfg).encode('utf-8')
+
+
+def load_config_bytes(b: bytes) -> dict:
+    return yaml.safe_load(b)
+
+# -------------------------
+# UI
+# -------------------------
+
+st.title('📊 Stock Market Visualizer')
+st.markdown('Fetch, analyze and visualize stock data with interactive charts and portfolio tools.')
+
+with st.sidebar:
+    st.header('Data Inputs')
+    ticker = st.text_input('Ticker (comma-separated for quick list)', value='AAPL')
+    interval = st.selectbox('Interval', options=['1d','1h','30m','15m','5m'], index=0)
+    period = st.selectbox('Period', options=['1mo','3mo','6mo','12mo','24mo','5y'], index=2)
+    fetch_btn = st.button('Fetch Data')
+    st.markdown('---')
+    st.header('Visual Options')
+    show_ema = st.checkbox('Show EMA (20/50/200)', value=True)
+    show_bb = st.checkbox('Show Bollinger Bands', value=True)
+    bb_squeeze_threshold = st.slider('BB squeeze width (fraction)', min_value=0.01, max_value=0.2, value=0.05, step=0.01)
+    fib_lookback = st.slider('Fibonacci lookback (days)', min_value=30, max_value=250, value=100, step=10)
+    st.markdown('---')
+    st.header('Portfolio')
+    uploaded = st.file_uploader('Upload portfolio CSV/XLSX (column: Ticker, Shares, AvgPrice)', type=['csv','xls','xlsx'])
+    st.markdown('---')
+    st.header('Config')
+    cfg_name = st.text_input('Config name (for save/load)', value='my_config')
+    save_cfg = st.button('Save config')
+    cfg_file = st.file_uploader('Load config (YAML)', type=['yaml','yml'])
+    st.markdown('---')
+    st.header('Export')
+    export_png = st.checkbox('Enable PNG export (kaleido required)', value=True)
+    export_html = st.checkbox('Enable HTML export', value=True)
+
+# Handle config save/load
+if save_cfg:
+    cfg = {
+        'ticker': ticker,
+        'interval': interval,
+        'period': period,
+        'show_ema': show_ema,
+        'show_bb': show_bb,
+        'bb_squeeze_threshold': float(bb_squeeze_threshold),
+        'fib_lookback': int(fib_lookback)
+    }
+    data = save_config(cfg)
+    st.download_button('Download config YAML', data=data, file_name=f'{cfg_name}.yaml')
+
+if cfg_file is not None:
+    try:
+        cfg = load_config_bytes(cfg_file.read())
+        ticker = cfg.get('ticker', ticker)
+        interval = cfg.get('interval', interval)
+        period = cfg.get('period', period)
+        show_ema = cfg.get('show_ema', show_ema)
+        show_bb = cfg.get('show_bb', show_bb)
+        bb_squeeze_threshold = cfg.get('bb_squeeze_threshold', bb_squeeze_threshold)
+        fib_lookback = cfg.get('fib_lookback', fib_lookback)
+        st.success('Config loaded — adjust inputs and press Fetch Data')
+    except Exception as e:
+        st.error(f'Failed to load config: {e}')
+
+# Portfolio processing
+portfolio_df = load_portfolio(uploaded)
+if not portfolio_df.empty:
+    with st.expander('Portfolio preview'):
+        st.dataframe(portfolio_df.head())
+
+# Fetch loop
+if not fetch_btn:
+    st.info('Set inputs in the sidebar and click **Fetch Data**')
+    st.stop()
+
+# Allow multiple tickers separated by comma
+tickers = [t.strip().upper() for t in ticker.split(',') if t.strip()]
+if len(tickers) == 0:
+    st.error('Please enter at least one ticker.')
+    st.stop()
+
+# We'll fetch and display the first ticker prominently; if multiple, fetch summary for correlation etc.
+main_ticker = tickers[0]
+
+try:
+    with st.spinner('Fetching data and computing indicators...'):
+        df = fetch_data(main_ticker, period=period, interval=interval)
+        df = add_indicators(df)
+        df = macd_signals(df)
+        df = ema_cross_signals(df)
+        df = bollinger_squeeze(df, width_threshold=bb_squeeze_threshold)
+        df = simple_rsi_divergence(df, lookback=14)
+        df = obv_confirm(df)
+        signals_df = compute_signals(df, fib_lookback)
+        fibs = fib_levels(df, lookback=fib_lookback)
+except Exception as e:
+    st.error(f'Error fetching or computing indicators: {e}')
+    st.stop()
+
+# Layout
+col1, col2 = st.columns([3,1])
+
+with col1:
+    st.subheader(f'{main_ticker} — Price & Indicators')
+    fig_price = plot_price(df, main_ticker, show_ema=show_ema, show_bb=show_bb, fibs=fibs)
+    st.plotly_chart(fig_price, use_container_width=True)
+
+    fig_rsi, fig_macd = plot_rsi_macd(df)
+    st.plotly_chart(fig_rsi, use_container_width=True)
+    st.plotly_chart(fig_macd, use_container_width=True)
+
+    fig_obv, fig_atr = plot_obv_atr(df)
+    st.plotly_chart(fig_obv, use_container_width=True)
+    st.plotly_chart(fig_atr, use_container_width=True)
+
+with col2:
+    st.subheader('Signals (short-term)')
+    if signals_df.empty:
+        st.write('No signals found in the chosen period.')
+    else:
+        st.dataframe(signals_df[['time','signal','price','reason','stop_loss']].assign(time=lambda d: pd.to_datetime(d['time']).dt.strftime('%Y-%m-%d %H:%M')))
+    st.markdown('---')
+    st.subheader('Latest indicators')
+    latest = df.iloc[-1][['Close','RSI','MACD','MACD_signal','EMA20','EMA50','EMA200','BB_upper','BB_lower','OBV','ATR']]
+    st.table(latest.to_frame().rename(columns={latest.name: 'Value'}))
+
+# Export: PNG/HTML
+export_col1, export_col2 = st.columns(2)
+with export_col1:
+    if export_png:
+        try:
+            buf = io.BytesIO()
+            # Use kaleido via plotly to write image
+            fig_price.write_image(buf, format='png')
+            buf.seek(0)
+            st.download_button('Download Price PNG', data=buf, file_name=f'{main_ticker}_price.png', mime='image/png')
+        except Exception as e:
+            st.error(f'PNG export failed (kaleido required): {e}')
+with export_col2:
+    if export_html:
+        html = fig_price.to_html(full_html=True)
+        st.download_button('Download Price HTML', data=html, file_name=f'{main_ticker}_price.html', mime='text/html')
+
+# Portfolio analytics & correlation
+if not portfolio_df.empty:
+    info_df, prices = portfolio_summary(portfolio_df)
+    if info_df is not None:
+        st.subheader('Portfolio prices & summary')
+        st.dataframe(info_df)
+        # correlation matrix based on historical returns of tickers
+        tickers_port = info_df['Ticker'].tolist()
+        price_dict = {}
+        for t in tickers_port:
+            try:
+                h = yf.download(t, period='1y', interval='1d', progress=False)['Close']
+                price_dict[t] = h
+            except Exception:
+                price_dict[t] = pd.Series(dtype=float)
+        price_df = pd.concat(price_dict, axis=1)
+        price_df = price_df.dropna()
+        if price_df.shape[1] >= 2:
+            returns = price_df.pct_change().dropna()
+            corr = returns.corr()
+            st.subheader('Correlation matrix (daily returns)')
+            st.dataframe(corr)
+            st.markdown('Heatmap:')
+            fig_corr = go.Figure(data=go.Heatmap(z=corr.values, x=corr.columns, y=corr.index))
+            st.plotly_chart(fig_corr, use_container_width=True)
+        else:
+            st.info('Need at least 2 tickers with 1 year daily data for correlation analysis.')
+
+# Quick tips & GitHub instructions
+st.markdown('---')
+st.subheader('Quick tips & next steps')
+st.markdown('''
+- Backtest any signal rules on historical data before live trading.
+- Adjust ATR multiplier in the code for different risk profiles.
+
+**Push to GitHub (simple steps):**
+```bash
+git init
+git add stock_market_visualizer.py requirements.txt
+git commit -m "Add Stock Market Visualizer"
+git branch -M main
+git remote add origin <YOUR_GITHUB_REPO_URL>
+git push -u origin main
+```
+Replace `<YOUR_GITHUB_REPO_URL>` with your repository URL.
+''')
+
+# End
+st.success('Done — interact with charts, upload portfolio, export charts and save configs.')
